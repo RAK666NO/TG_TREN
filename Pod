@@ -1,0 +1,215 @@
+import logging
+import sqlite3
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+
+# ========== КОНФИГУРАЦИЯ ==========
+BOT_TOKEN = "ВАШ_ТОКЕН_СЮДА"  # Токен от @BotFather
+
+# ========== БАЗА ВОПРОСОВ ==========
+QUESTIONS = {
+    'python': [
+        {'question': 'Как вывести текст в Python?', 'options': ['print("text")', 'console.log("text")', 'echo "text"', 'System.out.println("text")'], 'correct': 0},
+        {'question': 'Как создать список в Python?', 'options': ['list = []', 'array = []', 'arr = []', 'list()'], 'correct': 0},
+        {'question': 'Какая функция возвращает длину списка?', 'options': ['size()', 'length()', 'len()', 'count()'], 'correct': 2},
+        {'question': 'Как объявить функцию в Python?', 'options': ['function myFunc():', 'def myFunc():', 'func myFunc():', 'define myFunc():'], 'correct': 1}
+    ],
+    'javascript': [
+        {'question': 'Как вывести текст в JavaScript?', 'options': ['print("text")', 'console.log("text")', 'echo "text"', 'System.out.println("text")'], 'correct': 1},
+        {'question': 'Как объявить переменную в JS?', 'options': ['var x;', 'let x;', 'const x;', 'Все варианты'], 'correct': 3},
+        {'question': 'Как создать массив в JS?', 'options': ['[]', '{}', '()', '<>'], 'correct': 0}
+    ],
+    'java': [
+        {'question': 'Как вывести текст в Java?', 'options': ['print("text")', 'console.log("text")', 'System.out.println("text")', 'echo "text"'], 'correct': 2},
+        {'question': 'Что такое JVM?', 'options': ['Java Virtual Machine', 'Java Visual Model', 'Java Variable Memory', 'Java Version Manager'], 'correct': 0},
+        {'question': 'Какое ключевое слово для наследования?', 'options': ['extends', 'implements', 'inherits', 'super'], 'correct': 0}
+    ]
+}
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+
+# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
+conn = sqlite3.connect('trainer.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# Создание таблиц
+cursor.executescript('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        registered_at TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        language TEXT,
+        correct_answers INTEGER,
+        total_questions INTEGER,
+        date TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS user_sessions (
+        user_id INTEGER PRIMARY KEY,
+        language TEXT,
+        question_index INTEGER,
+        correct_count INTEGER,
+        total_count INTEGER
+    );
+''')
+conn.commit()
+
+# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
+def add_user(user_id, username, first_name):
+    cursor.execute('INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?)',
+                   (user_id, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+
+def start_session(user_id, language):
+    cursor.execute('INSERT OR REPLACE INTO user_sessions VALUES (?, ?, 0, 0, ?)',
+                   (user_id, language, len(QUESTIONS[language])))
+    conn.commit()
+
+def update_session(user_id, question_index, correct_count):
+    cursor.execute('UPDATE user_sessions SET question_index = ?, correct_count = ? WHERE user_id = ?',
+                   (question_index, correct_count, user_id))
+    conn.commit()
+
+def get_session(user_id):
+    cursor.execute('SELECT * FROM user_sessions WHERE user_id = ?', (user_id,))
+    return cursor.fetchone()
+
+def end_session(user_id):
+    cursor.execute('DELETE FROM user_sessions WHERE user_id = ?', (user_id,))
+    conn.commit()
+def save_stats(user_id, language, correct, total):
+    cursor.execute('INSERT INTO stats (user_id, language, correct_answers, total_questions, date) VALUES (?, ?, ?, ?, ?)',
+                   (user_id, language, correct, total, datetime.now().strftime("%Y-%m-%d")))
+    conn.commit()
+
+def get_user_stats(user_id):
+    cursor.execute('SELECT language, correct_answers, total_questions, date FROM stats WHERE user_id = ? ORDER BY date DESC', (user_id,))
+    return cursor.fetchall()
+
+# ========== КЛАВИАТУРЫ ==========
+def main_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("📚 Начать тренировку"))
+    kb.add(KeyboardButton("📊 Статистика"), KeyboardButton("ℹ️ О боте"))
+    return kb
+
+def languages_keyboard():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("Python", callback_data="lang_python"),
+        InlineKeyboardButton("JavaScript", callback_data="lang_javascript"),
+        InlineKeyboardButton("Java", callback_data="lang_java")
+    )
+    return kb
+
+# ========== ОТПРАВКА ВОПРОСА ==========
+async def send_question(user_id, language, q_index):
+    questions = QUESTIONS[language]
+    
+    if q_index >= len(questions):
+        session = get_session(user_id)
+        if session:
+            _, _, _, correct, total = session
+            save_stats(user_id, language, correct, total)
+            end_session(user_id)
+            
+            percent = (correct / total) * 100
+            await bot.send_message(user_id,
+                f"🎉 Завершено!\n{language.capitalize()}: {correct}/{total} ({percent:.1f}%)",
+                reply_markup=main_keyboard())
+        return
+    
+    q = questions[q_index]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for i, opt in enumerate(q['options']):
+        kb.add(InlineKeyboardButton(opt, callback_data=f"ans_{language}_{q_index}_{i}"))
+    
+    await bot.send_message(user_id, f"❓ Вопрос {q_index + 1}/{len(questions)}\n\n{q['question']}", 
+                          reply_markup=kb, parse_mode="Markdown")
+
+# ========== ОБРАБОТЧИКИ ==========
+@dp.message_handler(commands=['start'])
+async def cmd_start(msg: types.Message):
+    add_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
+    await msg.answer(f"👋 Привет, {msg.from_user.first_name}!\nЯ тренажер по программированию.", 
+                    reply_markup=main_keyboard())
+
+@dp.message_handler(lambda m: m.text == "📚 Начать тренировку")
+async def choose_lang(msg: types.Message):
+    await msg.answer("Выбери язык:", reply_markup=languages_keyboard())
+
+@dp.message_handler(lambda m: m.text == "📊 Статистика")
+async def show_stats(msg: types.Message):
+    stats = get_user_stats(msg.from_user.id)
+    if not stats:
+        await msg.answer("📊 Пока нет тренировок.", reply_markup=main_keyboard())
+        return
+    
+    text = "📊 Твоя статистика:\n\n"
+    for lang, corr, total, date in stats:
+        text += f"• {lang.capitalize()}: {corr}/{total} ({(corr/total*100):.1f}%)\n  📅 {date}\n\n"
+    
+    await msg.answer(text, reply_markup=main_keyboard())
+
+@dp.message_handler(lambda m: m.text == "ℹ️ О боте")
+async def about(msg: types.Message):
+    await msg.answer(
+        "🤖 Тренажер по программированию v1.0\n"
+        "Языки: Python, JavaScript, Java\n\n"
+        "Как пользоваться:\n"
+        "1. Начать тренировку\n"
+        "2. Выбрать язык\n"
+        "3. Отвечать на вопросы",
+        reply_markup=main_keyboard())
+
+@dp.callback_query_handler(lambda c: c.data.startswith('lang_'))
+async def process_language(call: types.CallbackQuery):
+    lang = call.data.replace('lang_', '')
+    start_session(call.from_user.id, lang)
+    await send_question(call.from_user.id, lang, 0)
+    await bot.answer_callback_query(call.id)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('ans_'))
+async def process_answer(call: types.CallbackQuery):
+    _, lang, q_idx, ans_idx = call.data.split('_')
+    q_idx, ans_idx = int(q_idx), int(ans_idx)
+    user_id = call.from_user.id
+    
+    session = get_session(user_id)
+    if not session:
+        await bot.answer_callback_query(call.id, "Сессия истекла. Начни заново!")
+        return
+    
+    _, _, _, correct, _ = session
+    is_correct = (ans_idx == QUESTIONS[lang][q_idx]['correct'])
+    
+    if is_correct:
+        correct += 1
+        await bot.answer_callback_query(call.id, "✅ Правильно!")
+    else:
+        correct_ans = QUESTIONS[lang][q_idx]['options'][QUESTIONS[lang][q_idx]['correct']]
+        await bot.answer_callback_query(call.id, f"❌ Неправильно!\nПравильно: {correct_ans}", show_alert=True)
+    
+    update_session(user_id, q_idx + 1, correct)
+    await send_question(user_id, lang, q_idx + 1)
+
+@dp.message_handler()
+async def other(msg: types.Message):
+    await msg.answer("Используй кнопки меню.", reply_markup=main_keyboard())
+
+# ========== ЗАПУСК ==========
+if name == 'main':
+    executor.start_polling(dp, skip_updates=True)
